@@ -47,11 +47,13 @@ class SpotifyTokenStore:
             os.getenv("TOKEN_STORE_REST_URL")
             or os.getenv("KV_REST_API_URL")
             or os.getenv("UPSTASH_REDIS_REST_URL")
+            or os.getenv("UPSTASH_REDIS_REST_KV_REST_API_URL")
         )
         self.token = (
             os.getenv("TOKEN_STORE_REST_TOKEN")
             or os.getenv("KV_REST_API_TOKEN")
             or os.getenv("UPSTASH_REDIS_REST_TOKEN")
+            or os.getenv("UPSTASH_REDIS_REST_KV_REST_API_TOKEN")
         )
 
     @property
@@ -141,4 +143,3 @@ class SpotifyTokenStore:
             "storage_configured": self.writable,
             "source": record.get("source", "durable_store"),
         }
-
