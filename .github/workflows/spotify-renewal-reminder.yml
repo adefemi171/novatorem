@@ -1,0 +1,78 @@
+name: Spotify renewal reminder
+
+on:
+  schedule:
+    - cron: "17 14 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  remind:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      STATUS_URL: https://adefemi-spotify.vercel.app/api/spotify-admin/status
+      REMINDER_SECRET: ${{ secrets.SPOTIFY_REMINDER_SECRET }}
+    steps:
+      - name: Check authorization lifetime
+        shell: bash
+        run: |
+          set -euo pipefail
+          status="$(curl --fail --silent --show-error \
+            -H "Authorization: Bearer ${REMINDER_SECRET}" \
+            "${STATUS_URL}")"
+
+          expiry="$(jq -r '.expires_at // empty' <<<"${status}")"
+          days="$(jq -r '.days_remaining // empty' <<<"${status}")"
+          connected="$(jq -r '.connected' <<<"${status}")"
+          expiry_date="${expiry%%T*}"
+
+          if [[ "${connected}" != "true" || -z "${expiry_date}" ]]; then
+            echo "Spotify authorization metadata is unavailable."
+            exit 1
+          fi
+
+          title="Spotify reconnect before ${expiry_date}"
+
+          while IFS=$'\t' read -r number old_title; do
+            if [[ -n "${number}" && "${old_title}" != "${title}" ]]; then
+              gh issue close "${number}" \
+                --comment "Closed automatically because Spotify was reconnected and now has a new authorization date."
+            fi
+          done < <(gh issue list --state open --limit 100 \
+            --search "Spotify reconnect before in:title" \
+            --json number,title --jq '.[] | [.number, .title] | @tsv')
+
+          if (( days > 30 )); then
+            echo "${days} days remain; no reminder is needed."
+            exit 0
+          fi
+
+          number="$(gh issue list --state all --limit 100 \
+            --search "${title} in:title" \
+            --json number,title --jq ".[] | select(.title == \"${title}\") | .number" \
+            | head -n 1)"
+
+          if [[ -z "${number}" ]]; then
+            number="$(gh issue create \
+              --title "${title}" \
+              --body $'Spotify requires this card to be authorized again every six months.\n\nOpen the private management page and select **Reconnect Spotify**. No Vercel secret editing or redeployment is needed.\n\n<!-- spotify-reminder-30 -->' \
+              | sed 's#.*/##')"
+          else
+            gh issue reopen "${number}" >/dev/null 2>&1 || true
+          fi
+
+          comments="$(gh issue view "${number}" --json body,comments \
+            --jq '[.body, .comments[].body] | join("\n")')"
+
+          for threshold in 14 3; do
+            marker="spotify-reminder-${threshold}"
+            if (( days <= threshold )) && ! grep -q "${marker}" <<<"${comments}"; then
+              gh issue comment "${number}" \
+                --body "Spotify authorization expires in ${days} day(s). Please reconnect it now. <!-- ${marker} -->"
+            fi
+          done
+

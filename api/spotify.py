@@ -1,13 +1,21 @@
 from io import BytesIO
 import os
 import json
+import hashlib
+import hmac
 import random
+import re
+import secrets
+import time
 import requests
 
 from colorthief import ColorThief
-from base64 import b64encode
+from base64 import b64encode, urlsafe_b64decode, urlsafe_b64encode
 from dotenv import load_dotenv, find_dotenv
-from flask import Flask, Response, render_template, request
+from flask import Flask, Response, jsonify, redirect, render_template, request
+from urllib.parse import urlencode
+
+from spotify_tokens import SpotifyTokenStore, TokenStoreError
 
 load_dotenv(find_dotenv())
 
@@ -18,10 +26,16 @@ PLACEHOLDER_IMAGE = "iVBORw0KGgoAAAANSUhEUgAAA4QAAAOEBAMAAAALYOIIAAAAFVBMVEXm5ub
 PLACEHOLDER_URL = "https://source.unsplash.com/random/300x300/?aerial"
 SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
 SPOTIFY_SECRET_ID = os.getenv("SPOTIFY_SECRET_ID")
-SPOTIFY_REFRESH_TOKEN = os.getenv("SPOTIFY_REFRESH_TOKEN")
 SPOTIFY_TOKEN = ""
+SPOTIFY_REDIRECT_URI = os.getenv("SPOTIFY_REDIRECT_URI")
+RECONNECT_SECRET = os.getenv("SPOTIFY_RECONNECT_SECRET")
+REMINDER_SECRET = os.getenv("SPOTIFY_REMINDER_SECRET") or RECONNECT_SECRET
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
 FALLBACK_THEME = "spotify.html.j2"
+ADMIN_COOKIE = "novatorem_spotify_admin"
+SIGNED_VALUE_MAX_AGE_SECONDS = 30 * 60
+STATE_MAX_AGE_SECONDS = 15 * 60
 
 REFRESH_TOKEN_URL = "https://accounts.spotify.com/api/token"
 NOW_PLAYING_URL = "https://api.spotify.com/v1/me/player/currently-playing"
@@ -30,6 +44,11 @@ RECENTLY_PLAYING_URL = (
 )
 
 app = Flask(__name__)
+TOKEN_STORE = SpotifyTokenStore()
+
+
+class SpotifyAuthError(RuntimeError):
+    pass
 
 
 def getAuth():
@@ -39,21 +58,32 @@ def getAuth():
 
 
 def refreshToken():
+    record = TOKEN_STORE.load()
+    if not record or not record.get("refresh_token"):
+        raise SpotifyAuthError("Spotify is not connected.")
+
     data = {
         "grant_type": "refresh_token",
-        "refresh_token": SPOTIFY_REFRESH_TOKEN,
+        "refresh_token": record["refresh_token"],
     }
 
     headers = {"Authorization": "Basic {}".format(getAuth())}
     response = requests.post(
-        REFRESH_TOKEN_URL, data=data, headers=headers).json()
+        REFRESH_TOKEN_URL, data=data, headers=headers, timeout=10
+    )
+    payload = response.json()
 
-    try:
-        return response["access_token"]
-    except KeyError:
-        print(json.dumps(response))
-        print("\n---\n")
-        raise KeyError(str(response))
+    if response.status_code != 200 or "access_token" not in payload:
+        error = payload.get("error", "spotify_token_refresh_failed")
+        print(json.dumps({"spotify_token_error": error}))
+        raise SpotifyAuthError(error)
+
+    # Spotify can rotate refresh tokens. Persist a replacement without changing
+    # the original six-month authorization date.
+    if payload.get("refresh_token"):
+        TOKEN_STORE.rotate_refresh_token(payload["refresh_token"])
+
+    return payload["access_token"]
 
 
 def get(url):
@@ -63,17 +93,207 @@ def get(url):
         SPOTIFY_TOKEN = refreshToken()
 
     response = requests.get(
-        url, headers={"Authorization": f"Bearer {SPOTIFY_TOKEN}"})
+        url, headers={"Authorization": f"Bearer {SPOTIFY_TOKEN}"}, timeout=10
+    )
 
     if response.status_code == 401:
         SPOTIFY_TOKEN = refreshToken()
         response = requests.get(
-            url, headers={"Authorization": f"Bearer {SPOTIFY_TOKEN}"}).json()
+            url,
+            headers={"Authorization": f"Bearer {SPOTIFY_TOKEN}"},
+            timeout=10,
+        ).json()
         return response
     elif response.status_code == 204:
         raise Exception(f"{url} returned no data.")
     else:
         return response.json()
+
+
+def _signed_value(purpose):
+    if not RECONNECT_SECRET:
+        raise SpotifyAuthError("SPOTIFY_RECONNECT_SECRET is not configured.")
+    payload = f"{purpose}:{int(time.time())}:{secrets.token_urlsafe(16)}"
+    encoded = urlsafe_b64encode(payload.encode()).decode().rstrip("=")
+    signature = hmac.new(
+        RECONNECT_SECRET.encode(), encoded.encode(), hashlib.sha256
+    ).hexdigest()
+    return f"{encoded}.{signature}"
+
+
+def _verify_signed_value(value, purpose, max_age):
+    if not value or not RECONNECT_SECRET:
+        return False
+    try:
+        encoded, signature = value.rsplit(".", 1)
+        expected = hmac.new(
+            RECONNECT_SECRET.encode(), encoded.encode(), hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            return False
+        padded = encoded + "=" * (-len(encoded) % 4)
+        payload = urlsafe_b64decode(padded.encode()).decode()
+        signed_purpose, signed_at, _ = payload.split(":", 2)
+        return signed_purpose == purpose and time.time() - int(signed_at) <= max_age
+    except (TypeError, ValueError):
+        return False
+
+
+def _admin_authenticated():
+    return _verify_signed_value(
+        request.cookies.get(ADMIN_COOKIE),
+        "admin",
+        SIGNED_VALUE_MAX_AGE_SECONDS,
+    )
+
+
+def _route_path(suffix):
+    if request.path.startswith("/api/spotify-admin/"):
+        prefix = "/api/spotify-admin"
+    elif request.path.startswith("/api/spotify/"):
+        prefix = "/api/spotify"
+    else:
+        prefix = ""
+    return f"{prefix}/{suffix.lstrip('/')}"
+
+
+def _public_url(suffix):
+    base_url = PUBLIC_BASE_URL or request.host_url.rstrip("/")
+    return f"{base_url}/api/spotify-admin/{suffix.lstrip('/')}"
+
+
+def _redirect_uri():
+    return SPOTIFY_REDIRECT_URI or _public_url("callback")
+
+
+def _management_response(**context):
+    response = Response(
+        render_template(
+            "manage.html.j2",
+            login_path=_route_path("login"),
+            **context,
+        ),
+        mimetype="text/html",
+    )
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Frame-Options"] = "DENY"
+    return response
+
+
+@app.route("/manage", methods=["GET", "POST"])
+@app.route("/api/spotify/manage", methods=["GET", "POST"])
+@app.route("/api/spotify-admin/manage", methods=["GET", "POST"])
+def spotify_manage():
+    authenticated = _admin_authenticated()
+
+    if request.method == "POST":
+        submitted = request.form.get("secret", "")
+        if RECONNECT_SECRET and hmac.compare_digest(submitted, RECONNECT_SECRET):
+            response = redirect(_route_path("manage"))
+            response.set_cookie(
+                ADMIN_COOKIE,
+                _signed_value("admin"),
+                max_age=SIGNED_VALUE_MAX_AGE_SECONDS,
+                secure=request.is_secure,
+                httponly=True,
+                samesite="Lax",
+            )
+            response.headers["Cache-Control"] = "no-store"
+            return response
+
+        return _management_response(
+            authenticated=False, status=TOKEN_STORE.status(), error=True
+        ), 401
+
+    return _management_response(
+        authenticated=authenticated,
+        status=TOKEN_STORE.status(),
+        connected=request.args.get("connected") == "1",
+        error=False,
+    )
+
+
+@app.route("/login")
+@app.route("/api/spotify/login")
+@app.route("/api/spotify-admin/login")
+def spotify_login():
+    if not _admin_authenticated():
+        return redirect(_route_path("manage"))
+    if not TOKEN_STORE.writable:
+        return _management_response(
+            authenticated=True,
+            status=TOKEN_STORE.status(),
+            connected=False,
+            error=False,
+        ), 503
+
+    params = {
+        "client_id": SPOTIFY_CLIENT_ID,
+        "response_type": "code",
+        "redirect_uri": _redirect_uri(),
+        "scope": "user-read-currently-playing user-read-recently-played",
+        "state": _signed_value("spotify_oauth"),
+        "show_dialog": "true",
+    }
+    return redirect("https://accounts.spotify.com/authorize?" + urlencode(params))
+
+
+@app.route("/callback")
+@app.route("/api/spotify/callback")
+@app.route("/api/spotify-admin/callback")
+def spotify_callback():
+    if request.args.get("error"):
+        return Response("Spotify authorization was cancelled.", status=400)
+    if not _verify_signed_value(
+        request.args.get("state"), "spotify_oauth", STATE_MAX_AGE_SECONDS
+    ):
+        return Response("Invalid or expired authorization request.", status=400)
+
+    code = request.args.get("code")
+    if not code:
+        return Response("Spotify did not return an authorization code.", status=400)
+
+    response = requests.post(
+        REFRESH_TOKEN_URL,
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": _redirect_uri(),
+        },
+        headers={"Authorization": "Basic {}".format(getAuth())},
+        timeout=10,
+    )
+    payload = response.json()
+    if response.status_code != 200 or not payload.get("refresh_token"):
+        print(json.dumps({"spotify_authorization_error": payload.get("error")}))
+        return Response("Spotify authorization could not be completed.", status=502)
+
+    try:
+        TOKEN_STORE.save_authorization(payload["refresh_token"])
+    except TokenStoreError:
+        return Response("The durable token store is not configured.", status=503)
+
+    global SPOTIFY_TOKEN
+    SPOTIFY_TOKEN = payload.get("access_token", "")
+    return redirect(_public_url("manage") + "?connected=1")
+
+
+@app.route("/status")
+@app.route("/api/spotify/status")
+@app.route("/api/spotify-admin/status")
+def spotify_status():
+    supplied = request.headers.get("Authorization", "").removeprefix("Bearer ")
+    reminder_authenticated = bool(
+        REMINDER_SECRET
+        and supplied
+        and hmac.compare_digest(supplied, REMINDER_SECRET)
+    )
+    if not (_admin_authenticated() or reminder_authenticated):
+        return jsonify({"error": "unauthorized"}), 401
+
+    response = jsonify(TOKEN_STORE.status())
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 def barGen(barCount):
@@ -96,7 +316,9 @@ def barGen(barCount):
 
 
 def gradientGen(albumArtURL, color_count):
-    colortheif = ColorThief(BytesIO(requests.get(albumArtURL).content))
+    colortheif = ColorThief(
+        BytesIO(requests.get(albumArtURL, timeout=10).content)
+    )
     palette = colortheif.get_palette(color_count)
     return palette
 
@@ -111,8 +333,20 @@ def getTemplate():
         return FALLBACK_THEME
 
 def loadImageB64(url):
-    response = requests.get(url)
+    response = requests.get(url, timeout=10)
     return b64encode(response.content).decode("ascii")
+
+
+def normalizeColor(value, fallback):
+    return value if re.fullmatch(r"[0-9a-fA-F]{6}", value or "") else fallback
+
+
+def makeErrorSVG(background_color, border_color):
+    return render_template(
+        "spotify-error.html.j2",
+        background_color=background_color,
+        border_color=border_color,
+    )
 
 
 def makeSVG(data, background_color, border_color):
@@ -167,18 +401,26 @@ def makeSVG(data, background_color, border_color):
 @app.route("/<path:path>")
 @app.route('/with_parameters')
 def catch_all(path):
-    background_color = request.args.get('background_color') or "181414"
-    border_color = request.args.get('border_color') or "181414"
+    background_color = normalizeColor(
+        request.args.get('background_color'), "181414"
+    )
+    border_color = normalizeColor(request.args.get('border_color'), "181414")
 
     try:
-        data = get(NOW_PLAYING_URL)
-    except Exception:
-        data = get(RECENTLY_PLAYING_URL)
-
-    svg = makeSVG(data, background_color, border_color)
+        try:
+            data = get(NOW_PLAYING_URL)
+        except Exception:
+            data = get(RECENTLY_PLAYING_URL)
+        svg = makeSVG(data, background_color, border_color)
+        spotify_status_header = "connected"
+    except Exception as error:
+        print(json.dumps({"spotify_card_fallback": type(error).__name__}))
+        svg = makeErrorSVG(background_color, border_color)
+        spotify_status_header = "reconnect-required"
 
     resp = Response(svg, mimetype="image/svg+xml")
     resp.headers["Cache-Control"] = "s-maxage=1"
+    resp.headers["X-Spotify-Status"] = spotify_status_header
 
     return resp
 

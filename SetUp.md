@@ -43,6 +43,36 @@ curl -X POST -H "Content-Type: application/x-www-form-urlencoded" -H "Authorizat
 
 * Deploy!
 
+## One-click renewal (recommended)
+
+Spotify refresh tokens created by Development Mode apps expire after six
+months. This fork includes a protected renewal page so expiry never requires
+copying a token into Vercel or redeploying the card.
+
+1. Create an Upstash Redis database from the Vercel Marketplace and connect it
+   to this project.
+2. Map its REST credentials to `TOKEN_STORE_REST_URL` and
+   `TOKEN_STORE_REST_TOKEN`. The standard `KV_REST_API_*` and
+   `UPSTASH_REDIS_REST_*` names are also detected automatically.
+3. Add these Vercel environment variables:
+   * `PUBLIC_BASE_URL=https://YOUR_PROJECT.vercel.app`
+   * `SPOTIFY_REDIRECT_URI=https://YOUR_PROJECT.vercel.app/api/spotify-admin/callback`
+   * `SPOTIFY_RECONNECT_SECRET` (a new random secret)
+   * `SPOTIFY_REMINDER_SECRET` (a different new random secret)
+   * `SPOTIFY_AUTHORIZED_AT` (the UTC date of the current authorization, until
+     the first one-click reconnect migrates it into Redis)
+4. Add the exact `SPOTIFY_REDIRECT_URI` value to the Spotify application's
+   redirect URI allowlist.
+5. Open `https://YOUR_PROJECT.vercel.app/api/spotify-admin/manage`, enter the
+   reconnect secret, and choose **Reconnect Spotify** once. The callback writes
+   the new refresh token and six-month expiry date to Redis automatically.
+6. Add `SPOTIFY_REMINDER_SECRET` as a GitHub Actions repository secret. The
+   included daily workflow opens an issue 30 days before expiry and adds
+   follow-ups at 14 and 3 days.
+
+If authorization expires, the public endpoint continues returning a valid SVG
+that explains the connection needs renewal rather than returning an error.
+
 ## Deploy to Heroku  
 
 [![Deploy](https://www.herokucdn.com/deploy/button.svg)](https://dashboard.heroku.com/new?template=https%3A%2F%2Fgithub.com%2Fnovatorem%2Fnovatorem)
